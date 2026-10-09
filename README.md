@@ -12,6 +12,8 @@ This repository provides an architecture breakdown. Application source code, dep
 
 - [Project at a glance](#project-at-a-glance)
 - [Architecture](#architecture)
+- [DMZ isolation and network security](#dmz-isolation-and-network-security)
+- [Docker and container runtime](#docker-and-container-runtime)
 - [Application and rendering](#application-and-rendering)
 - [Compute and resource usage](#compute-and-resource-usage)
 - [Containers and runtime](#containers-and-runtime)
@@ -54,27 +56,38 @@ Resource measurements below are snapshots from the deployment, not load-test res
 flowchart TD
     visitor["Visitor browser"]
     dns["Cloudflare DNS"]
-    edge["pfSense WAN firewall and NAT"]
+    admin["Administrator on private LAN"]
 
     subgraph host["Proxmox host"]
-        subgraph vm["Ubuntu Server VM"]
-            runner["GitHub Actions runner / systemd"]
-            engine["Docker Engine"]
-            subgraph net["Compose bridge network"]
-                caddy["Caddy / published TCP 80 and 443"]
-                web["Nginx / internal TCP 8080"]
+        edge["pfSense VM / WAN, LAN and DMZ routing"]
+
+        subgraph lan["Private LAN subnet / separate bridge"]
+            private["Proxmox management and private workloads"]
+        end
+
+        subgraph dmz["Isolated DMZ subnet / dedicated internal bridge"]
+            subgraph vm["Ubuntu web VM / DMZ interface only"]
+                runner["GitHub Actions runner / systemd"]
+                engine["Docker Engine and Compose"]
+                subgraph net["Docker bridge network inside the VM"]
+                    caddy["Caddy container / published TCP 80 and 443"]
+                    web["Nginx container / internal TCP 8080"]
+                end
+                certs[("Persistent Caddy volumes")]
             end
-            certs[("Persistent Caddy data")]
         end
     end
 
     actions["GitHub Actions and artifacts"]
     visitor -. "Resolve domain" .-> dns
     visitor -->|"HTTPS to public address"| edge
-    edge -->|"Forward TCP 443"| caddy
+    edge -->|"Forward permitted web traffic into DMZ"| caddy
+    admin -->|"LAN-initiated access"| edge
+    edge -->|"Permitted administration"| vm
+    edge -- "New DMZ-to-LAN connections blocked" --x private
     caddy -->|"HTTP to web:8080"| web
     caddy --- certs
-    runner -->|"Outbound HTTPS"| actions
+    runner -->|"Outbound HTTPS via pfSense"| actions
     runner -->|"Load image and apply Compose"| engine
     engine -. "Manages" .-> caddy
     engine -. "Manages" .-> web
@@ -131,7 +144,7 @@ The image contains the compiled frontend and a release identifier. Nginx serves 
 
 The web container runs as a non-root user with a read-only root filesystem, limited temporary writable storage, dropped Linux capabilities, and privilege escalation disabled. CPU, memory, and process limits constrain resource consumption.
 
-### Caddy reverse proxy
+I moved the website from the private LAN to a **dedicated DMZ: a separate subnet for the public workload**. The goal is to keep a compromised web VM from initiating unrestricted connections to private devices or management services.
 
 Caddy is the public entry point. It handles HTTPS and forwards requests to Nginx over the Docker network. Nginx has no direct published host port.
 
@@ -166,16 +179,17 @@ Local clients use the internal resolver to reach the web VM directly, while exte
 ```mermaid
 flowchart TD
     public["Visitor outside the home network"]
-    local["Visitor on the home LAN"]
+    local["Visitor on the private LAN"]
     publicdns["Public DNS / Cloudflare zone"]
     localdns["pfSense DNS Resolver overrides"]
     wan["Public IPv4 / pfSense port forward"]
-    private["Private web VM address"]
-    caddy["Caddy serves the same domain certificate"]
+    private["Private web VM address on the DMZ subnet"]
+    route["pfSense / permitted LAN-to-DMZ routing"]
+    caddy["Caddy in the DMZ / same domain certificate"]
 
     public -->|"Domain lookup"| publicdns
     publicdns -->|"Public address"| wan
-    wan -->|"TCP 443 forwarding"| caddy
+    wan -->|"TCP 443 forwarding into DMZ"| caddy
     local -->|"Domain lookup"| localdns
     localdns -->|"Private address"| private
     private -->|"Direct LAN connection"| caddy
@@ -193,13 +207,13 @@ Caddy obtains and renews publicly trusted certificates for the configured hostna
 sequenceDiagram
     participant B as Browser
     participant D as DNS resolver
-    participant F as pfSense
-    participant C as Caddy
-    participant N as Nginx
+    participant F as pfSense / DMZ boundary
+    participant C as Caddy / DMZ web VM
+    participant N as Nginx / Docker network
     B->>D: Resolve safishahid.com
     D-->>B: Public address
     B->>F: Connect to TCP 443
-    F->>C: Forward connection to VM
+    F->>C: Forward permitted HTTPS into DMZ
     B->>C: TLS handshake through forwarded connection
     C-->>B: Certificate and TLS negotiation
     B->>C: Encrypted HTTP request
